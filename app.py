@@ -18,12 +18,12 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 # CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Field Ops Dispatch System",
+    page_title="Time Out Dispatch System",
     page_icon="🚚",
     layout="wide"
 )
 
-st.title("🚚 Field Operations Dispatch System")
+st.title("🚚 Time Out Operations Dispatch System")
 
 SAVE_FILE = "last_dispatch.json"
 GEO_CACHE_FILE = "geo_cache.json"
