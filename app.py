@@ -18,12 +18,12 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 # CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Lawn Care CRM Dispatch",
+    page_title="Time Out Lawncare Dispatch",
     page_icon="🌿",
     layout="wide"
 )
 
-st.title("🌿 Lawn Care CRM Dispatch System")
+st.title("🌿 Time Out Lawncare Dispatch System")
 
 
 # =========================================================
