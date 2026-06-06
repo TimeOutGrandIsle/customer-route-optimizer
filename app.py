@@ -2,31 +2,35 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
-import re
 import json
 import os
+import re
+import time
 
 from urllib.parse import quote
-from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime
+from math import radians, sin, cos, sqrt, atan2
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 
 # =========================================================
-# CONFIG
+# APP CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Time Out Dispatch System",
-    page_icon="🚚",
+    page_title="Lawn Care CRM Dispatch",
+    page_icon="🌿",
     layout="wide"
 )
 
-st.title("🚚 Time Out Operations Dispatch System")
+st.title("🌿 Lawn Care CRM Dispatch System")
 
-SAVE_FILE = "last_dispatch.json"
-GEO_CACHE_FILE = "geo_cache.json"
+
+# =========================================================
+# FILES
+# =========================================================
+SAVE_FILE = "dispatch_session.json"
+CACHE_FILE = "geo_cache.json"
 
 
 # =========================================================
@@ -38,94 +42,173 @@ if "dispatch" not in st.session_state:
 if "completed" not in st.session_state:
     st.session_state.completed = set()
 
-if "arrival_times" not in st.session_state:
-    st.session_state.arrival_times = {}
+if "arrived" not in st.session_state:
+    st.session_state.arrived = {}
 
-if "completion_times" not in st.session_state:
-    st.session_state.completion_times = {}
+if "completed_time" not in st.session_state:
+    st.session_state.completed_time = {}
 
 
 # =========================================================
-# LOAD SAVED DISPATCH
+# LOAD CACHE
 # =========================================================
-if (
-    st.session_state.dispatch is None
-    and os.path.exists(SAVE_FILE)
-):
+if os.path.exists(CACHE_FILE):
+    try:
+        GEO_CACHE = json.load(open(CACHE_FILE))
+    except:
+        GEO_CACHE = {}
+else:
+    GEO_CACHE = {}
+
+
+def save_cache():
+    with open(CACHE_FILE, "w") as f:
+        json.dump(GEO_CACHE, f)
+
+
+# =========================================================
+# GOOGLE API KEY (STREAMLIT SECRETS)
+# =========================================================
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+
+
+# =========================================================
+# CLEAN ADDRESS
+# =========================================================
+def clean(addr):
+    if pd.isna(addr):
+        return ""
+    addr = str(addr)
+    addr = re.sub(r"\s+", " ", addr)
+    return addr.strip()
+
+
+# =========================================================
+# GOOGLE GEOCODE
+# =========================================================
+def google_geocode(address):
+    if not GOOGLE_API_KEY:
+        return None
 
     try:
+        url = (
+            "https://maps.googleapis.com/maps/api/geocode/json"
+            f"?address={quote(address)}&key={GOOGLE_API_KEY}"
+        )
 
-        with open(SAVE_FILE, "r") as f:
+        r = requests.get(url, timeout=10).json()
 
-            st.session_state.dispatch = json.load(f)
+        if r.get("status") == "OK":
+            loc = r["results"][0]["geometry"]["location"]
+            return {"lat": loc["lat"], "lon": loc["lng"]}
 
     except:
         pass
 
+    return None
+
 
 # =========================================================
-# LOAD GEO CACHE
+# OSM FALLBACK
 # =========================================================
-if os.path.exists(GEO_CACHE_FILE):
-
+def osm_geocode(address):
     try:
+        url = (
+            "https://nominatim.openstreetmap.org/search"
+            f"?q={quote(address)}&format=json&limit=1&countrycodes=us"
+        )
 
-        with open(GEO_CACHE_FILE, "r") as f:
+        r = requests.get(
+            url,
+            headers={"User-Agent": "crm-dispatch"},
+            timeout=10
+        ).json()
 
-            GEO_CACHE = json.load(f)
+        if r:
+            return {
+                "lat": float(r[0]["lat"]),
+                "lon": float(r[0]["lon"])
+            }
 
     except:
+        pass
 
-        GEO_CACHE = {}
-
-else:
-
-    GEO_CACHE = {}
+    return None
 
 
 # =========================================================
-# GOOGLE API KEY
+# GEOCODER (PRODUCTION)
 # =========================================================
-GOOGLE_API_KEY = st.secrets.get(
-    "GOOGLE_API_KEY",
-    ""
-)
+def geocode(address):
+
+    address = clean(address)
+
+    if address in GEO_CACHE:
+        return GEO_CACHE[address]
+
+    for attempt in [
+        address,
+        address + ", USA",
+        address + ", Mississippi"
+    ]:
+
+        g = google_geocode(attempt)
+        if g:
+            GEO_CACHE[address] = g
+            save_cache()
+            return g
+
+        g = osm_geocode(attempt)
+        if g:
+            GEO_CACHE[address] = g
+            save_cache()
+            return g
+
+        time.sleep(0.2)
+
+    return None
 
 
 # =========================================================
-# HELPERS
+# DISTANCE (FALLBACK)
 # =========================================================
-def clean(addr):
+def haversine(a, b):
+    R = 6371
 
-    if addr is None:
-        return ""
+    lat1 = radians(a["lat"])
+    lon1 = radians(a["lon"])
+    lat2 = radians(b["lat"])
+    lon2 = radians(b["lon"])
 
-    addr = str(addr)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
 
-    addr = re.sub(r"\s+", " ", addr)
-
-    return addr.strip()
-
-
-def nav(address):
-
-    return (
-        "https://www.google.com/maps/search/?api=1&query="
-        + quote(address)
+    x = (
+        sin(dlat / 2) ** 2
+        + cos(lat1) * cos(lat2)
+        * sin(dlon / 2) ** 2
     )
 
+    return 2 * R * atan2(sqrt(x), sqrt(1 - x))
+
 
 # =========================================================
-# GOOGLE MAPS FULL ROUTE
+# GOOGLE MAPS NAV
 # =========================================================
-def full_route_link(addresses):
+def nav(addr):
+    return "https://www.google.com/maps/search/?api=1&query=" + quote(addr)
+
+
+# =========================================================
+# CHUNKED ROUTE LINKS
+# =========================================================
+def route_links(addresses):
 
     if len(addresses) < 2:
-        return None
-
-    chunks = []
+        return []
 
     max_stops = 10
+    links = []
 
     for i in range(0, len(addresses), max_stops):
 
@@ -135,645 +218,165 @@ def full_route_link(addresses):
             continue
 
         origin = quote(chunk[0])
+        dest = quote(chunk[-1])
 
-        destination = quote(chunk[-1])
-
-        waypoints = "|".join(
-            quote(x)
-            for x in chunk[1:-1]
-        )
+        waypoints = "|".join(quote(x) for x in chunk[1:-1])
 
         url = (
             "https://www.google.com/maps/dir/?api=1"
             f"&origin={origin}"
-            f"&destination={destination}"
+            f"&destination={dest}"
             f"&travelmode=driving"
         )
 
         if waypoints:
             url += f"&waypoints={waypoints}"
 
-        chunks.append(url)
+        links.append(url)
 
-    return chunks
-
-
-# =========================================================
-# SAVE GEO CACHE
-# =========================================================
-def save_geo_cache():
-
-    try:
-
-        with open(GEO_CACHE_FILE, "w") as f:
-
-            json.dump(GEO_CACHE, f)
-
-    except:
-        pass
-
-
-# =========================================================
-# ADDRESS NORMALIZATION
-# =========================================================
-def normalize_address(address):
-
-    address = clean(address)
-
-    replacements = {
-
-        " dr.": " drive",
-        " dr ": " drive ",
-
-        " rd.": " road",
-        " rd ": " road ",
-
-        " st.": " street",
-        " st ": " street ",
-
-        " blvd.": " boulevard",
-        " blvd ": " boulevard ",
-
-        " ct.": " court",
-        " ct ": " court ",
-
-        " cir.": " circle",
-        " cir ": " circle ",
-
-        " hwy ": " highway ",
-
-        " ln.": " lane",
-        " ln ": " lane ",
-
-        " ave.": " avenue",
-        " ave ": " avenue "
-    }
-
-    addr = " " + address.lower() + " "
-
-    for k, v in replacements.items():
-
-        addr = addr.replace(k, v)
-
-    addr = re.sub(r"\s+", " ", addr)
-
-    return addr.strip()
-
-
-# =========================================================
-# GOOGLE GEOCODE
-# =========================================================
-def google_geocode(address):
-
-    if not GOOGLE_API_KEY:
-        return None
-
-    try:
-
-        url = (
-            "https://maps.googleapis.com/maps/api/geocode/json"
-            f"?address={quote(address)}"
-            f"&key={GOOGLE_API_KEY}"
-        )
-
-        response = requests.get(
-            url,
-            timeout=10
-        ).json()
-
-        status = response.get("status")
-
-        if (
-            status == "OK"
-            and response.get("results")
-        ):
-
-            loc = (
-                response["results"][0]
-                ["geometry"]
-                ["location"]
-            )
-
-            return {
-                "lat": loc["lat"],
-                "lon": loc["lng"]
-            }
-
-    except:
-        pass
-
-    return None
-
-
-# =========================================================
-# OSM GEOCODE
-# =========================================================
-def osm_geocode(address):
-
-    try:
-
-        url = (
-            "https://nominatim.openstreetmap.org/search"
-            f"?q={quote(address)}"
-            f"&format=json"
-            f"&limit=1"
-            f"&countrycodes=us"
-        )
-
-        headers = {
-            "User-Agent": "field-ops-routing"
-        }
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=10
-        ).json()
-
-        if response:
-
-            return {
-                "lat": float(response[0]["lat"]),
-                "lon": float(response[0]["lon"])
-            }
-
-    except:
-        pass
-
-    return None
-
-
-# =========================================================
-# PRODUCTION GEOCODER
-# =========================================================
-def geocode(address):
-
-    address = normalize_address(address)
-
-    # =====================================================
-    # CACHE HIT
-    # =====================================================
-    if address in GEO_CACHE:
-
-        return GEO_CACHE[address]
-
-    attempts = [
-
-        address,
-
-        address + ", USA",
-
-        address + ", Brandon, MS",
-
-        address + ", Mississippi",
-
-        address.replace("highway", "hwy"),
-
-        address.replace("street", "st"),
-
-        address.replace("drive", "dr"),
-
-        address.replace("court", "ct"),
-
-        address.replace("circle", "cir")
-    ]
-
-    attempts = list(dict.fromkeys(attempts))
-
-    for attempt in attempts:
-
-        # =================================================
-        # GOOGLE FIRST
-        # =================================================
-        result = google_geocode(attempt)
-
-        if result:
-
-            GEO_CACHE[address] = result
-
-            save_geo_cache()
-
-            return result
-
-        # =================================================
-        # FALLBACK OSM
-        # =================================================
-        result = osm_geocode(attempt)
-
-        if result:
-
-            GEO_CACHE[address] = result
-
-            save_geo_cache()
-
-            return result
-
-        time.sleep(0.15)
-
-    return None
-
-
-# =========================================================
-# DISTANCE
-# =========================================================
-def haversine(a, b):
-
-    R = 6371
-
-    lat1 = radians(a["lat"])
-    lon1 = radians(a["lon"])
-
-    lat2 = radians(b["lat"])
-    lon2 = radians(b["lon"])
-
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-
-    x = (
-        sin(dlat / 2) ** 2
-        + cos(lat1)
-        * cos(lat2)
-        * sin(dlon / 2) ** 2
-    )
-
-    return 2 * R * atan2(
-        sqrt(x),
-        sqrt(1 - x)
-    )
-
-
-# =========================================================
-# CLUSTER KEY
-# =========================================================
-def cluster_key(address):
-
-    parts = address.split(",")
-
-    if len(parts) > 0:
-
-        street = parts[0].strip().lower()
-
-        words = street.split()
-
-        if len(words) > 1:
-
-            return words[-1]
-
-    return "other"
-
-
-# =========================================================
-# ROUTE SOLVER
-# =========================================================
-def solve_route(locations, matrix):
-
-    n = len(locations)
-
-    manager = pywrapcp.RoutingIndexManager(
-        n,
-        1,
-        0
-    )
-
-    routing = pywrapcp.RoutingModel(manager)
-
-    def cb(i, j):
-
-        return int(
-            matrix[
-                manager.IndexToNode(i)
-            ][
-                manager.IndexToNode(j)
-            ]
-        )
-
-    transit = routing.RegisterTransitCallback(cb)
-
-    routing.SetArcCostEvaluatorOfAllVehicles(
-        transit
-    )
-
-    params = pywrapcp.DefaultRoutingSearchParameters()
-
-    params.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
-
-    params.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
-
-    params.time_limit.FromSeconds(30)
-
-    solution = routing.SolveWithParameters(params)
-
-    if not solution:
-        return None
-
-    route = []
-
-    total = 0
-
-    index = routing.Start(0)
-
-    while not routing.IsEnd(index):
-
-        node = manager.IndexToNode(index)
-
-        route.append(node)
-
-        prev = index
-
-        index = solution.Value(
-            routing.NextVar(index)
-        )
-
-        total += matrix[
-            manager.IndexToNode(prev)
-        ][
-            manager.IndexToNode(index)
-        ]
-
-    route.append(
-        manager.IndexToNode(index)
-    )
-
-    return route, total
+    return links
 
 
 # =========================================================
 # FILE UPLOAD
 # =========================================================
-uploaded_file = st.file_uploader(
-    "Upload Customer List",
-    type=["xlsx", "xls"]
-)
+uploaded = st.file_uploader("Upload Customer Excel", type=["xlsx"])
 
 df = None
 
-if uploaded_file:
-
-    try:
-
-        df = pd.read_excel(uploaded_file)
-
-        st.success(
-            f"Loaded {len(df)} customers"
-        )
-
-    except Exception as e:
-
-        st.error(f"Excel read error: {e}")
+if uploaded:
+    df = pd.read_excel(uploaded)
+    st.success(f"Loaded {len(df)} customers")
+    st.dataframe(df)
 
 
 # =========================================================
-# MAIN
+# MAIN UI
 # =========================================================
 if df is not None:
 
-    st.subheader("📋 Customer Selection")
+    address_col = st.selectbox("Address Column", df.columns)
 
-    address_col = st.selectbox(
-        "Address Column",
-        df.columns
-    )
-
-    depot = st.text_input(
-        "Depot Address (optional)"
-    )
+    depot = st.text_input("Depot Address (start only, not a stop)")
 
     df["Include"] = True
 
-    edited_df = st.data_editor(
-        df,
-        use_container_width=True
-    )
+    edited = st.data_editor(df, use_container_width=True)
 
-    selected_df = edited_df[
-        edited_df["Include"] == True
-    ]
+    selected = edited[edited["Include"] == True]
 
-    st.success(
-        f"{len(selected_df)} customers selected"
-    )
+    st.info(f"Selected customers: {len(selected)}")
 
     # =====================================================
-    # GENERATE ROUTE
+    # GENERATE DISPATCH
     # =====================================================
     if st.button("🚀 Generate Dispatch"):
 
         locations = []
         failed = []
 
-        depot_location = None
+        depot_loc = None
 
-        st.info("Geocoding addresses...")
-
-        # =================================================
         # DEPOT
-        # =================================================
         if depot:
+            g = geocode(depot)
+            if g:
+                depot_loc = {"address": depot, **g}
 
-            geo = geocode(depot)
-
-            if geo:
-
-                depot_location = {
-                    "address": depot,
-                    **geo
-                }
-
-        # =================================================
         # CUSTOMERS
-        # =================================================
         progress = st.progress(0)
+        total = len(selected)
 
-        total_rows = len(selected_df)
+        for i, (_, row) in enumerate(selected.iterrows(), start=1):
 
-        for counter, (_, row) in enumerate(
-            selected_df.iterrows(),
-            start=1
-        ):
-
-            addr = clean(
-                row[address_col]
-            )
-
+            addr = clean(row[address_col])
             geo = geocode(addr)
 
             if geo:
-
-                locations.append({
-                    "address": addr,
-                    **geo
-                })
-
+                locations.append({"address": addr, **geo})
             else:
-
                 failed.append(addr)
 
-            percent = int(
-                (counter / max(total_rows, 1)) * 100
-            )
+            progress.progress(min(int(i / max(total, 1) * 100), 100))
+            time.sleep(0.1)
 
-            percent = min(percent, 100)
-
-            progress.progress(percent)
-
-        # =================================================
-        # RESULTS
-        # =================================================
-        st.success(
-            f"Valid geocodes: {len(locations)}"
-        )
-
+        st.success(f"Geocoded: {len(locations)}")
         if failed:
-
-            st.warning(
-                f"Failed geocodes: {len(failed)}"
-            )
-
-            st.dataframe(
-                pd.DataFrame(
-                    failed,
-                    columns=["Failed Address"]
-                )
-            )
+            st.warning(f"Failed: {len(failed)}")
+            st.dataframe(pd.DataFrame(failed, columns=["Failed"]))
 
         if len(locations) < 2:
-
-            st.error(
-                "Not enough valid locations"
-            )
-
+            st.error("Not enough valid locations")
             st.stop()
 
         # =================================================
-        # CLUSTER
+        # ROUTE MATRIX
         # =================================================
-        st.info("Clustering neighborhoods...")
-
-        customer_locs = locations.copy()
-
-        customer_locs.sort(
-            key=lambda x: (
-                cluster_key(x["address"]),
-                x["lat"],
-                x["lon"]
-            )
-        )
-
-        locations = customer_locs
-
-        # =================================================
-        # ADD DEPOT AS START ONLY
-        # =================================================
-        if depot_location:
-
-            locations.insert(0, depot_location)
-
-        # =================================================
-        # MATRIX
-        # =================================================
-        st.info("Building road network matrix...")
-
         n = len(locations)
-
         matrix = np.zeros((n, n))
 
         for i in range(n):
-
             for j in range(n):
-
                 if i == j:
                     continue
-
                 try:
-
                     url = (
                         "https://router.project-osrm.org/route/v1/driving/"
                         f"{locations[i]['lon']},{locations[i]['lat']};"
-                        f"{locations[j]['lon']},{locations[j]['lat']}"
-                        "?overview=false"
+                        f"{locations[j]['lon']},{locations[j]['lat']}?overview=false"
                     )
 
-                    r = requests.get(
-                        url,
-                        timeout=8
-                    ).json()
-
-                    seconds = (
-                        r["routes"][0]["duration"]
-                    )
-
-                    matrix[i][j] = int(
-                        seconds / 60
-                    )
+                    r = requests.get(url, timeout=5).json()
+                    matrix[i][j] = int(r["routes"][0]["duration"] / 60)
 
                 except:
-
-                    matrix[i][j] = int(
-                        haversine(
-                            locations[i],
-                            locations[j]
-                        ) * 2
-                    )
+                    matrix[i][j] = int(haversine(locations[i], locations[j]) * 2)
 
         # =================================================
-        # SOLVE
+        # OPTIMIZE
         # =================================================
-        st.info("Optimizing route...")
+        manager = pywrapcp.RoutingIndexManager(n, 1, 0)
+        routing = pywrapcp.RoutingModel(manager)
 
-        result = solve_route(
-            locations,
-            matrix
-        )
+        def cb(i, j):
+            return int(matrix[manager.IndexToNode(i)][manager.IndexToNode(j)])
 
-        if not result:
+        transit = routing.RegisterTransitCallback(cb)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit)
 
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        params.time_limit.FromSeconds(20)
+
+        solution = routing.SolveWithParameters(params)
+
+        if not solution:
             st.error("Routing failed")
-
             st.stop()
 
-        route, total = result
+        index = routing.Start(0)
+        route = []
 
-        ordered = [
-            locations[i]
-            for i in route
-        ]
+        while not routing.IsEnd(index):
+            route.append(manager.IndexToNode(index))
+            index = solution.Value(routing.NextVar(index))
 
-        # =================================================
-        # REMOVE DEPOT FROM DRIVER STOPS
-        # =================================================
-        if depot_location:
+        route.append(manager.IndexToNode(index))
 
-            ordered = ordered[1:]
+        ordered = [locations[i] for i in route]
 
-        # =================================================
-        # SAVE
-        # =================================================
-        st.session_state.dispatch = {
-            "ordered": ordered,
-            "total": total,
-            "depot": depot_location
-        }
+        if depot_loc:
+            ordered = ordered[1:]  # remove depot from stops
 
+        # SAVE SESSION
+        st.session_state.dispatch = ordered
         st.session_state.completed = set()
+        st.session_state.arrived = {}
+        st.session_state.completed_time = {}
 
-        st.session_state.arrival_times = {}
+        json.dump(ordered, open(SAVE_FILE, "w"))
 
-        st.session_state.completion_times = {}
-
-        with open(SAVE_FILE, "w") as f:
-
-            json.dump(
-                st.session_state.dispatch,
-                f
-            )
-
-        st.success(
-            "Dispatch generated successfully"
-        )
+        st.success("Dispatch created")
 
 
 # =========================================================
@@ -781,202 +384,66 @@ if df is not None:
 # =========================================================
 if st.session_state.dispatch:
 
-    ordered = st.session_state.dispatch["ordered"]
-
-    depot_location = st.session_state.dispatch.get(
-        "depot"
-    )
+    ordered = st.session_state.dispatch
 
     st.subheader("🚚 Dispatch Board")
 
-    # =====================================================
-    # FULL GOOGLE ROUTE LINKS
-    # =====================================================
-    route_addresses = [
-        x["address"]
-        for x in ordered
-    ]
+    # GOOGLE MAPS ROUTE
+    addresses = [x["address"] for x in ordered]
+    links = route_links(addresses)
 
-    if depot_location:
+    if links:
+        st.subheader("🗺️ Google Maps Route")
+        for i, l in enumerate(links):
+            st.markdown(f"[Route Segment {i+1}]({l})")
 
-        route_addresses.insert(
-            0,
-            depot_location["address"]
-        )
-
-    route_links = full_route_link(
-        route_addresses
-    )
-
-    if route_links:
-
-        st.subheader("🗺️ Full Google Maps Route")
-
-        for idx, link in enumerate(route_links):
-
-            st.markdown(
-                f"[Open Route Segment {idx+1}]({link})"
-            )
-
-    # =====================================================
-    # DISPATCH TABLE
-    # =====================================================
-    board = []
-
+    # TABLE
+    table = []
     for i, stop in enumerate(ordered):
-
-        board.append({
+        table.append({
             "Stop": i + 1,
             "Address": stop["address"],
-            "Completed": (
-                i in st.session_state.completed
-            ),
-            "Navigate": nav(stop["address"])
+            "Navigate": nav(stop["address"]),
+            "Completed": i in st.session_state.completed
         })
 
-    dispatch_df = pd.DataFrame(board)
-
-    st.dataframe(
-        dispatch_df,
-        use_container_width=True
-    )
+    st.dataframe(pd.DataFrame(table), use_container_width=True)
 
     st.download_button(
-        "📥 Download Dispatch CSV",
-        dispatch_df.to_csv(index=False),
+        "Download Dispatch CSV",
+        pd.DataFrame(table).to_csv(index=False),
         "dispatch.csv",
         "text/csv"
     )
 
-    # =====================================================
-    # ACTIVE STOPS
-    # =====================================================
-    st.subheader("🚚 Active Stops")
+    # STOPS
+    st.subheader("Active Stops")
 
     for i, stop in enumerate(ordered):
 
         st.markdown(f"### Stop {i+1}")
-
         st.write(stop["address"])
 
-        col1, col2, col3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-        # =================================================
-        # ARRIVED
-        # =================================================
-        with col1:
+        with c1:
+            if i not in st.session_state.arrived:
+                if st.button(f"Arrived {i+1}", key=f"a{i}"):
+                    st.session_state.arrived[i] = datetime.now()
 
-            if (
-                i
-                not in st.session_state.arrival_times
-            ):
-
-                if st.button(
-                    f"Arrived #{i+1}",
-                    key=f"arrive_{i}"
-                ):
-
-                    st.session_state.arrival_times[i] = (
-                        datetime.now().strftime(
-                            "%I:%M:%S %p"
-                        )
-                    )
-
-        # =================================================
-        # COMPLETE
-        # =================================================
-        with col2:
-
-            if (
-                i
-                not in st.session_state.completed
-            ):
-
-                if st.button(
-                    f"Complete #{i+1}",
-                    key=f"complete_{i}"
-                ):
-
+        with c2:
+            if i not in st.session_state.completed:
+                if st.button(f"Complete {i+1}", key=f"c{i}"):
                     st.session_state.completed.add(i)
+                    st.session_state.completed_time[i] = datetime.now()
 
-                    st.session_state.completion_times[i] = (
-                        datetime.now().strftime(
-                            "%I:%M:%S %p"
-                        )
-                    )
+        with c3:
+            st.markdown(f"[Navigate]({nav(stop['address'])})")
 
-        # =================================================
-        # NAVIGATE
-        # =================================================
-        with col3:
+        if i in st.session_state.arrived:
+            st.success(f"Arrived: {st.session_state.arrived[i]}")
 
-            st.markdown(
-                f"[Navigate]"
-                f"({nav(stop['address'])})"
-            )
-
-        # =================================================
-        # STATUS
-        # =================================================
-        arrival = (
-            st.session_state.arrival_times.get(i)
-        )
-
-        complete = (
-            st.session_state.completion_times.get(i)
-        )
-
-        if arrival:
-
-            st.success(
-                f"Arrived: {arrival}"
-            )
-
-        if complete:
-
-            st.info(
-                f"Completed: {complete}"
-            )
-
-        # =================================================
-        # DURATION
-        # =================================================
-        if arrival and complete:
-
-            fmt = "%I:%M:%S %p"
-
-            try:
-
-                start = datetime.strptime(
-                    arrival,
-                    fmt
-                )
-
-                end = datetime.strptime(
-                    complete,
-                    fmt
-                )
-
-                duration = (
-                    end - start
-                ).total_seconds() / 60
-
-                st.metric(
-                    f"Stop {i+1} Duration",
-                    f"{int(duration)} min"
-                )
-
-            except:
-                pass
+        if i in st.session_state.completed_time:
+            st.info(f"Completed: {st.session_state.completed_time[i]}")
 
         st.divider()
-
-    # =====================================================
-    # PERFORMANCE
-    # =====================================================
-    st.subheader("📊 Route Performance")
-
-    st.metric(
-        "Completed Stops",
-        len(st.session_state.completed)
-    )
